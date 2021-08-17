@@ -5,7 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
-
+#include "spinlock.h"
+#include "proc.h"
 /*
  * the kernel's page table.
  */
@@ -47,6 +48,44 @@ kvminit()
   kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 }
 
+pagetable_t
+proc_kernel_pagetable()
+{
+    pagetable_t user_kernel_pagetable = uvmcreate();
+    if (user_kernel_pagetable == 0)
+        return 0;
+
+    // uart registers
+    if (mappages(user_kernel_pagetable, UART0, PGSIZE, UART0, PTE_R | PTE_W) != 0)
+        panic("proc_kernel_pagetable: uart mapping");
+
+    // virtio mmio disk interface
+    if (mappages(user_kernel_pagetable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) != 0)
+        panic("proc_kernel_pagetable: virtio mapping");
+
+    // CLINT
+//    if (mappages(user_kernel_pagetable, CLINT, 0x10000, CLINT, PTE_R | PTE_W) != 0)
+//        panic("proc_kernel_pagetable: CLINT mapping");
+
+    // PLIC
+    if (mappages(user_kernel_pagetable, PLIC, 0x400000, PLIC, PTE_R | PTE_W) != 0)
+        panic("proc_kernel_pagetable: PLIC mapping");
+
+    // map kernel text executable and read-only.
+    if (mappages(user_kernel_pagetable, KERNBASE, (uint64)etext-KERNBASE, KERNBASE, PTE_R | PTE_X) != 0)
+        panic("proc_kernel_pagetable: KERNELBASE");
+
+    // map kernel data and the physical RAM we'll make use of.
+    if (mappages(user_kernel_pagetable, (uint64)etext, PHYSTOP-(uint64)etext, (uint64)etext, PTE_R | PTE_W) != 0)
+        panic("proc_kernel_pagetable: etext");
+
+    // map the trampoline for trap entry/exit to
+    // the highest virtual address in the kernel.
+    if (mappages(user_kernel_pagetable, TRAMPOLINE, PGSIZE, TRAMPOLINE, PTE_R | PTE_X) != 0)
+        panic("proc_kernel_pagetable: TRAMPOLINE");
+    return user_kernel_pagetable;
+}
+
 // Switch h/w page table register to the kernel's page table,
 // and enable paging.
 void
@@ -74,11 +113,13 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
   if(va >= MAXVA)
     panic("walk");
 
+  // 从顶级页表向下寻找
   for(int level = 2; level > 0; level--) {
     pte_t *pte = &pagetable[PX(level, va)];
     if(*pte & PTE_V) {
       pagetable = (pagetable_t)PTE2PA(*pte);
     } else {
+        // 不要求分配或者分配失败
       if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
         return 0;
       memset(pagetable, 0, PGSIZE);
@@ -132,7 +173,7 @@ kvmpa(uint64 va)
   pte_t *pte;
   uint64 pa;
   
-  pte = walk(kernel_pagetable, va, 0);
+  pte = walk(myproc()->kernel_pagetable, va, 0);
   if(pte == 0)
     panic("kvmpa");
   if((*pte & PTE_V) == 0)
@@ -439,4 +480,30 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+void
+vmprint(pagetable_t pagetable)
+{
+    printf("page table %p\n", pagetable);
+    vmprint_help(pagetable, 0);
+}
+
+void
+vmprint_help(pagetable_t pagetable, int depth)
+{
+    for(int i = 0; i < 512; i++) {
+        pte_t pte = pagetable[i];
+        if(pte & PTE_V){
+            // this PTE points to a lower-level page table.
+            uint64 child = PTE2PA(pte);
+            for (int i=0; i<depth; i++) {
+                printf(".. ");
+            }
+            printf("..%d: pte %p pa %p\n", i, pte, child);
+            if ((pte & (PTE_R|PTE_W|PTE_X)) == 0) {
+                vmprint_help((pagetable_t)child, depth+1);
+            }
+        }
+    }
 }
